@@ -10,15 +10,25 @@ import {
   type DocumentData,
   type Firestore,
 } from "firebase/firestore";
-import type { HostDocument, HostElectionPort } from "../../ports/host-election-port";
+import type {
+  CandidateStage,
+  HostDocument,
+  HostElectionPort,
+} from "../../ports/host-election-port";
 import type { RoomId, SignalingPeerId } from "../../types";
 import type { Logger, Unsubscribe } from "@/shared/kernel";
+import { expiresAt, type Retention } from "./expiry";
 
 export class FirestoreHostElectionAdapter implements HostElectionPort {
   constructor(
     private readonly client: Firestore,
-    private readonly logger: Logger
+    private readonly logger: Logger,
+    private readonly retention: Retention
   ) {}
+
+  private expiry(ttlMs: number) {
+    return expiresAt(this.retention.clock, ttlMs);
+  }
 
   private hostRef(roomId: RoomId) {
     return doc(this.client, "rooms", roomId, "host", "current");
@@ -38,7 +48,10 @@ export class FirestoreHostElectionAdapter implements HostElectionPort {
   }
 
   async writeHost(roomId: RoomId, peerId: SignalingPeerId): Promise<void> {
-    await setDoc(this.hostRef(roomId), { signalingPeerId: peerId });
+    await setDoc(this.hostRef(roomId), {
+      signalingPeerId: peerId,
+      expiresAt: this.expiry(this.retention.config.roomRetentionMs),
+    });
   }
 
   async clearHost(roomId: RoomId): Promise<void> {
@@ -56,9 +69,14 @@ export class FirestoreHostElectionAdapter implements HostElectionPort {
   async registerCandidate(
     roomId: RoomId,
     peerId: SignalingPeerId,
-    deadHostPeerId: SignalingPeerId
+    deadHostPeerId: SignalingPeerId,
+    stage: CandidateStage
   ): Promise<void> {
-    await setDoc(this.candidateRef(roomId, peerId), { deadHostPeerId });
+    await setDoc(this.candidateRef(roomId, peerId), {
+      deadHostPeerId,
+      confirmed: stage === "confirmed",
+      expiresAt: this.expiry(this.retention.config.candidateRetentionMs),
+    });
   }
 
   async removeCandidate(roomId: RoomId, peerId: SignalingPeerId): Promise<void> {
@@ -67,11 +85,18 @@ export class FirestoreHostElectionAdapter implements HostElectionPort {
 
   async listCandidates(
     roomId: RoomId,
-    deadHostPeerId: SignalingPeerId
+    deadHostPeerId: SignalingPeerId,
+    stage?: CandidateStage
   ): Promise<SignalingPeerId[]> {
     const snapshot = await getDocs(this.candidatesRef(roomId));
     return snapshot.docs
-      .filter((document) => document.data().deadHostPeerId === deadHostPeerId)
+      .filter((document) => {
+        const data = document.data();
+        return (
+          data.deadHostPeerId === deadHostPeerId &&
+          (stage !== "confirmed" || data.confirmed === true)
+        );
+      })
       .map((document) => document.id);
   }
 
@@ -88,7 +113,10 @@ export class FirestoreHostElectionAdapter implements HostElectionPort {
     return runTransaction(this.client, async (tx) => {
       const snapshot = await tx.get(this.hostRef(roomId));
       if (!snapshot.exists() || snapshot.data().signalingPeerId !== expectedPeerId) return false;
-      tx.set(this.hostRef(roomId), { signalingPeerId: newPeerId });
+      tx.set(this.hostRef(roomId), {
+        signalingPeerId: newPeerId,
+        expiresAt: this.expiry(this.retention.config.roomRetentionMs),
+      });
       return true;
     });
   }

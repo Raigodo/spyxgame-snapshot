@@ -1,5 +1,6 @@
 import {
   Emitter,
+  logFailure,
   type Clock,
   type IdGenerator,
   type Logger,
@@ -15,6 +16,7 @@ import type {
 } from "./types";
 import { HostElectionService } from "./host-election-service";
 import { PendingSignalAckTracker } from "./pending-signal-ack-tracker";
+import { PeerRemover, type ManualRemovalReason } from "./peer-remover";
 import type { HostElectionPort } from "./ports/host-election-port";
 import type { RoomMembershipPort } from "./ports/room-membership-port";
 import type { SignalInboxPort } from "./ports/signal-inbox-port";
@@ -39,6 +41,8 @@ export class SignalingSession {
   );
   private hostElectionService?: HostElectionService;
   private ackTracker?: PendingSignalAckTracker;
+  private remover?: PeerRemover;
+  private ackTimeoutVeto: (peerId: SignalingPeerId) => boolean = () => false;
   private mailbox?: SignalingMailbox;
   private unsubscribeFromPeers?: () => void;
 
@@ -92,13 +96,23 @@ export class SignalingSession {
       localPeerId: peerId,
     });
     this.mailbox = mailbox;
+    const remover = new PeerRemover({
+      membership,
+      messages,
+      logger: logger.child("remove"),
+      roomId,
+    });
+    this.remover = remover;
     this.ackTracker = new PendingSignalAckTracker({
       mailbox,
       clock,
       logger: logger.child("acks"),
       config,
       onTimedOut: (deadPeerId) => {
-        void membership.removePeer(roomId, deadPeerId);
+        if (this.ackTimeoutVeto(deadPeerId)) return; // alive by another route (open link)
+        void remover
+          .remove(deadPeerId, "ack-timeout")
+          .catch(logFailure(logger, "remove unresponsive peer"));
       },
     });
 
@@ -113,7 +127,7 @@ export class SignalingSession {
     this.hostElectionService = new HostElectionService({
       membership,
       election,
-      messages,
+      remover,
       clock,
       logger: logger.child("election"),
       config,
@@ -133,35 +147,50 @@ export class SignalingSession {
     const { membership, messages, election, logger } = this.deps;
     const roomId = this.localRoomId;
     const localPeerId = this.localPeerId;
+    const hostElection = this.hostElectionService;
 
     this.stopTrackingPeers();
     this.mailbox?.stopReceiving();
     this.mailbox = undefined;
     this.ackTracker = undefined;
+    this.remover = undefined;
 
-    await messages.clearInbox(roomId, localPeerId).catch((error) => {
-      logger.warn("Failed to clear own inbox on leave", error);
+    // Every remote step is best-effort: one failure must not skip the rest, above all the
+    // membership removal, or a ghost stays in the room.
+    await this.bestEffort("clear own inbox", () => messages.clearInbox(roomId, localPeerId));
+
+    await this.bestEffort("release host seat", async () => {
+      const currentHost = await election.getHost(roomId);
+      if (currentHost?.signalingPeerId === localPeerId) {
+        logger.debug("Leaving as host, clearing host document");
+        await election.clearHost(roomId);
+      }
     });
 
-    const currentHost = await election.getHost(roomId);
-    if (currentHost?.signalingPeerId === localPeerId) {
-      logger.debug("Leaving as host, clearing host document");
-      await election.clearHost(roomId);
-    }
+    // Not required for correctness (candidate lists are filtered to live peers), just tidier.
+    await this.bestEffort("remove own candidacy", async () => {
+      await hostElection?.removeOwnCandidacy();
+    });
 
-    // Best-effort cleanup of any election candidacy we registered. Not required for
-    // correctness (candidate lists are filtered to live peers anyway), just tidier.
-    await this.hostElectionService?.removeOwnCandidacy();
-
-    this.hostElectionService?.stop();
+    hostElection?.stop();
     this.hostElectionService = undefined;
-
     this.tracker.clear();
 
-    await membership.removePeer(roomId, localPeerId);
+    await this.bestEffort("remove own membership", () =>
+      membership.removePeer(roomId, localPeerId)
+    );
 
     this.localRoomId = undefined;
     this.localPeerId = undefined;
+  }
+
+  /** Runs one cleanup step; a failure is logged, never thrown. */
+  private async bestEffort(what: string, step: () => Promise<void>): Promise<void> {
+    try {
+      await step();
+    } catch (error) {
+      logFailure(this.deps.logger, what)(error);
+    }
   }
 
   get host(): HostElectionService {
@@ -175,6 +204,16 @@ export class SignalingSession {
     return this.tracker.getAll();
   }
 
+  inspect(): Record<string, unknown> {
+    return {
+      roomId: this.localRoomId,
+      peerId: this.localPeerId,
+      members: this.tracker.getAll().map((p) => p.peerId),
+      election: this.hostElectionService?.inspect() ?? null,
+      removals: this.remover?.inspect() ?? null,
+    };
+  }
+
   onPeerJoined(handler: (peer: SignalingPeer) => void): () => void {
     return this.tracker.onPeerAdded(handler);
   }
@@ -184,8 +223,7 @@ export class SignalingSession {
   }
 
   onSignalReceived(handler: SignalReceivedHandler): () => void {
-    this.signalReceived.on(handler);
-    return () => this.signalReceived.clear();
+    return this.signalReceived.on(handler);
   }
 
   async sendOffer(
@@ -216,14 +254,22 @@ export class SignalingSession {
 
   // Forcibly removes another peer from the room. No liveness opinion here; that judgment
   // belongs to whoever calls this (see PlayerSession).
-  async removePeer(peerId: SignalingPeerId): Promise<void> {
-    if (!this.localRoomId) {
+  async removePeer(
+    peerId: SignalingPeerId,
+    reason: ManualRemovalReason = "host-removed"
+  ): Promise<void> {
+    if (!this.remover) {
       throw new Error("[SignalingSession] Not joined to a room.");
     }
-    await this.deps.membership.removePeer(this.localRoomId, peerId);
-    await this.deps.messages.clearInbox(this.localRoomId, peerId).catch((error) => {
-      this.deps.logger.warn("Failed to clear removed peer's inbox", error);
-    });
+    await this.remover.remove(peerId, reason);
+  }
+
+  /**
+   * The RTC layer's say over ack-timeout removals: return true to keep the peer (it may mark the
+   * link fragile as a side effect). Without a veto, an unanswered signal removes the peer.
+   */
+  setAckTimeoutVeto(veto: (peerId: SignalingPeerId) => boolean): void {
+    this.ackTimeoutVeto = veto;
   }
 
   // ─── Private ──────────────────────────────────────────────────────────────

@@ -9,7 +9,14 @@ export interface AppConfig {
   signaling: {
     candidateCollectionWindowMs: number;
     positionIntervalMs: number;
+    /** After confirming candidacy, how long to wait for the other candidates to confirm. */
+    candidateConfirmWindowMs: number;
     ackTimeoutMs: number;
+    /** Firestore TTL for signal messages and election candidates (transient). */
+    messageRetentionMs: number;
+    candidateRetentionMs: number;
+    /** Firestore TTL for room, membership and host docs. A live session longer than this loses them. */
+    roomRetentionMs: number;
   };
   webrtc: {
     iceServers: readonly IceServerConfig[];
@@ -51,9 +58,13 @@ export type ConfigOverrides = { [K in keyof AppConfig]?: Partial<AppConfig[K]> }
 
 export const DEFAULT_CONFIG: AppConfig = {
   signaling: {
-    candidateCollectionWindowMs: 5_000,
-    positionIntervalMs: 5_000,
+    candidateCollectionWindowMs: 3_000,
+    positionIntervalMs: 1_500,
+    candidateConfirmWindowMs: 700,
     ackTimeoutMs: 15_000,
+    messageRetentionMs: 60 * 60 * 1000,
+    candidateRetentionMs: 60 * 60 * 1000,
+    roomRetentionMs: 7 * 24 * 60 * 60 * 1000,
   },
   webrtc: {
     iceServers: [
@@ -78,7 +89,7 @@ export const DEFAULT_CONFIG: AppConfig = {
     duplicateRevealTimeoutMs: 4_000,
     helloIntervalMs: 3_000,
     linkWaitMs: 8_000,
-    departureGraceMs: 10_000,
+    departureGraceMs: 4_000,
   },
   chat: {
     burst: 30,

@@ -50,6 +50,13 @@ export class RtcReconnectionManager {
     this.guestTimers.clear();
   }
 
+  inspect(): Record<string, unknown> {
+    return {
+      offerWatches: Array.from(this.offerWatches.keys()),
+      guestTimers: this.guestTimers.size,
+    };
+  }
+
   // ─── Connection death (an active connection that dropped) ─────────────────
 
   async handleConnectionDied(signalingPeerId: SignalingPeerId): Promise<void> {
@@ -160,7 +167,6 @@ export class RtcReconnectionManager {
 
     this.suspectHostDead(signalingPeerId);
 
-    // WebRtcService split.
     const cancel = clock.after(config.reconnectTimeoutMs, () => {
       this.guestTimers.delete(cancel);
       if (isLeaving()) return;
